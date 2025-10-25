@@ -74,9 +74,12 @@ class GameState:
         self._grid_shape = grid_shape
         self._enemy_path = enemy_path
         self._step = step
-        self._cycle = None if self._enemy_path else self._step % len(self._enemy_path)
         self._original_grid = original_grid
         self._grid_world_ref = grid_world_ref
+        if self._enemy_path:
+            self._step % len(self._enemy_path)
+        else:
+            self._cycle = None
 
     def __hash__(self):
         if self._cycle:
