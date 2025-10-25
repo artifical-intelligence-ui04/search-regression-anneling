@@ -40,7 +40,7 @@ import numpy as np
 import os
 import time
 
-NODE_EXPANSION_COST = 0.01
+NODE_EXPANSION_COST = 0
 GRASS_PASSING_COST = 5
 BUSH_PASSING_COST = 100
 ENEMY_COLLISION_PENALTY = 10000
@@ -66,24 +66,35 @@ def play(map_name, search_algorithm, delay=1000):
 
 
 class GameState:
-    __slots__ = ('_agent_pos', '_targets', '_step', '_grid_shape', '_enemy_path', '_original_grid', '_grid_world_ref')
+    __slots__ = ('_agent_pos', '_targets', '_step', '_cycle', '_grid_shape', '_enemy_path', '_original_grid', '_grid_world_ref')
 
     def __init__(self, agent_position, targets, step, grid_shape, enemy_path, original_grid, grid_world_ref):
         self._agent_pos = agent_position
         self._targets = frozenset(targets)
-        self._step = step
         self._grid_shape = grid_shape
         self._enemy_path = enemy_path
+        self._step = step
+        self._cycle = None if self._enemy_path else self._step % len(self._enemy_path)
         self._original_grid = original_grid
         self._grid_world_ref = grid_world_ref
 
     def __hash__(self):
-        return hash((self._agent_pos, self._targets, self._step))
+        if self._cycle:
+            return hash((self._agent_pos,
+                        self._targets,
+                        self._cycle
+                        ))
+        else:
+            return hash((self._agent_pos, self._targets))
 
     def __eq__(self, other):
-        return (self._agent_pos == other.get_agent_position() and
-                list(self._targets) == other.get_targets_frozenset() and
-                self._step == other.get_step_count())
+        return (self.get_agent_position() == other.get_agent_position() and
+                self.get_targets_frozenset() == other.get_targets_frozenset() and
+                self.get_enemy_cycle() == other.get_enemy_cycle()
+                )
+
+    def get_enemy_cycle(self):
+        return self._cycle
 
     def get_targets_frozenset(self):
         return self._targets
@@ -111,6 +122,12 @@ class GameState:
             return self._enemy_path[(self._step + 1) % len(self._enemy_path)]
         return None
 
+    def get_enemy_previous_position(self):
+        if self._enemy_path:
+            if self._step > 0:
+                return self._enemy_path[(self._step - 1) % len(self._enemy_path)]
+        return None
+
     def get_enemy_path(self):
         return self._enemy_path
 
@@ -120,15 +137,14 @@ class GameState:
     def get_terrain_cost(self, position):
         r, c = position
         cost = 0
-        cell_type = self._original_grid[r, c]
-        if cell_type in ['T', 'A', 'G', 'R', 'E']:
-            cost += GRASS_PASSING_COST
         if r < 0 or r >= self._grid_shape[0] or c < 0 or c >= self._grid_shape[1]:
             cost += GRASS_PASSING_COST
-        elif cell_type == 'B':
-            cost += BUSH_PASSING_COST
-        if self.get_enemy_position() == position:
-            cost += ENEMY_COLLISION_PENALTY
+        else:
+            cell_type = self._original_grid[r, c]
+            if cell_type in ['T', 'A', 'G', 'R', 'E']:
+                cost += GRASS_PASSING_COST
+            elif cell_type == 'B':
+                cost += BUSH_PASSING_COST
         return cost
 
     def get_targets_positions(self):
@@ -142,23 +158,23 @@ class GameState:
         return len(self._targets) == 0 and self._agent_pos != self.get_enemy_position()
 
     def is_collision_state(self):
-        return self._agent_pos == self.get_enemy_position() or self._agent_pos == self.get_enemy_next_position()
+        return self._agent_pos == self.get_enemy_position() or self._agent_pos == self.get_enemy_previous_position()
 
-
-
-    def get_all_successors(self):
+    def get_successors(self, toward_walls=False):
         successors = []
 
         for action, (dr, dc) in DIRECTIONS.items():
             new_r, new_c = self._agent_pos[0] + dr, self._agent_pos[1] + dc
-            old_r, old_c = self._agent_pos[0], self._agent_pos[1]
+
             new_pos = (new_r, new_c)
 
-            if not (0 <= new_r < self._grid_shape[0] and
-                    0 <= new_c < self._grid_shape[1]):
-                new_pos = (old_r, old_c)
-            elif self._original_grid[new_r, new_c] == 'R':
-                new_pos = (old_r, old_c)
+            if (not ((0 <= new_r < self._grid_shape[0] and
+                    0 <= new_c < self._grid_shape[1])) or
+                    (self._original_grid[new_r, new_c] == 'R')):
+                if toward_walls:
+                    new_pos = self._agent_pos
+                else:
+                    continue
 
             new_targets = self._update_targets(new_pos)
 
@@ -173,36 +189,8 @@ class GameState:
                 self._original_grid,
                 self._grid_world_ref
             )
-            successors.append((action, cost, new_state))
-        return successors
 
-    def get_successors(self):
-        successors = []
-
-        for action, (dr, dc) in DIRECTIONS.items():
-            new_r, new_c = self._agent_pos[0] + dr, self._agent_pos[1] + dc
-
-            new_pos = (new_r, new_c)
-
-            if not (0 <= new_r < self._grid_shape[0] and
-                    0 <= new_c < self._grid_shape[1]):
-                continue
-            elif self._original_grid[new_r, new_c] == 'R':
-                continue
-
-            new_targets = self._update_targets(new_pos)
-
-            cost = self.get_terrain_cost(new_pos)
-
-            new_state = GameState(
-                new_pos,
-                new_targets,
-                self._step + 1,
-                self._grid_shape,
-                self._enemy_path,
-                self._original_grid,
-                self._grid_world_ref
-            )
+            cost += ENEMY_COLLISION_PENALTY if new_state.is_collision_state() else 0
             successors.append((action, cost, new_state))
 
         return successors
@@ -230,26 +218,14 @@ class CountingGameState:
         self._state = state
         self._counter = counter
 
-    def get_all_successors(self):
-        successors = self._state.get_all_successors()
-        self._counter.increment_more(len(successors))
+    def get_successors(self, toward_walls=False):
+        successors = self._state.get_successors(toward_walls=toward_walls)
+        self._counter.increment()
 
         counted_successors = []
         for action, cost, state in successors:
             counted_state = CountingGameState(state, self._counter)
             counted_successors.append((action, cost, counted_state))
-
-        return counted_successors
-
-    def get_successors(self):
-        successors = self._state.get_successors()
-        self._counter.increment_more(len(successors))
-
-        counted_successors = []
-        for action, cost, state in successors:
-            counted_state = CountingGameState(state, self._counter)
-            counted_successors.append((action, cost, counted_state))
-
         return counted_successors
 
     def get_expanded_nodes(self):
@@ -262,10 +238,7 @@ class CountingGameState:
         return self._state.__hash__()
 
     def __eq__(self, other):
-        if isinstance(other, CountingGameState):
-            return self._state == other._state
         return self._state == other
-
 
 class CallCounter:
     def __init__(self):
@@ -273,11 +246,6 @@ class CallCounter:
 
     def increment(self):
         self._count += 1
-
-    def increment_more(self, count):
-        if count < 0:
-            raise ValueError('count must be positive')
-        self._count += count
 
     def get_count(self):
         return self._count
@@ -292,7 +260,7 @@ class GridWorld:
         self._grid_data = None
         self._initial_state = None
         self._enemy_path = []
-        self._expanded_nodes = 0
+        self._expanded_nodes = None
         self._total_cost = 0
         self._targets_count = 0
 
@@ -310,15 +278,11 @@ class GridWorld:
         self._load_assets()
 
 
-
-
-
-
     def reset(self):
         self._original_grid = None
         self._grid_data = None
         self._initial_state = None
-        self._expanded_nodes = 0
+        self._expanded_nodes = None
         self._total_cost = 0
 
         # Pygame assets
@@ -459,18 +423,15 @@ class GridWorld:
         pygame.display.set_caption(f"Search Environment - {self._map_name}")
         self._pygame_initialized = True
 
-    def _draw(self, state):
+    def _draw(self, agent_pos, enemy_pos, targets, cell_cost, step_count):
         if not self._pygame_initialized:
             self._initialize_pygame()
 
         self._screen.fill((0, 0, 0))
 
         rows, cols = self._original_grid.shape
-        agent_pos = state.get_agent_position()
-        enemy_pos = state.get_enemy_position()
-        bushes = state.get_bushes_positions()
-        targets = state.get_targets_positions()
-        rocks = state.get_rocks_positions()
+        bushes = self.get_bushes_positions()
+        rocks = self.get_rocks_positions()
 
         for r in range(rows):
             for c in range(cols):
@@ -513,12 +474,14 @@ class GridWorld:
                                             self._cell_size)
                     self._screen.blit(self._images['rock'], rock_rect)
 
-        self._draw_hud(state)
+        self._draw_hud(targets, cell_cost, step_count)
 
         pygame.display.flip()
 
 
-    def _draw_hud(self, state):
+
+
+    def _draw_hud(self, targets, cell_cost, step_count):
         rows, cols = self._original_grid.shape
         hud_y = rows * self._cell_size
 
@@ -530,11 +493,11 @@ class GridWorld:
                          2)
 
         if self._font:
-            targets_text = self._font.render(f"Targets: {len(state.get_targets_positions())}", True, (255, 255, 255))
+            targets_text = self._font.render(f"Targets: {len(targets)}", True, (255, 255, 255))
             self._screen.blit(targets_text, (self._cell_size * 0.1 , hud_y + 10))
 
-            cell_cost = state.get_terrain_cost(state.get_agent_position())
-            steps_text = self._font.render(f"Steps: {state.get_step_count()} (Cost: {cell_cost})", True, (255, 255, 255))
+            cell_cost = cell_cost
+            steps_text = self._font.render(f"Steps: {step_count} (Cost: {cell_cost})", True, (255, 255, 255))
             self._screen.blit(steps_text, (self._cell_size * 1.6, hud_y + 10))
 
     def run_game(self, search_algorithm, delay=1000):
@@ -545,17 +508,18 @@ class GridWorld:
         start_time = time.time()
         initial_state = CountingGameState(self._initial_state, CallCounter())
         actions = search_algorithm(initial_state)
-        self._expanded_nodes = initial_state.get_expanded_nodes()
+        actions_count = len(actions) if actions else 0
+        self._expanded_nodes = initial_state.get_expanded_nodes
         search_time = time.time() - start_time
 
-        print(f"Search completed in {search_time:.2f}s, found {len(actions)} actions")
+        print(f"Search completed in {search_time:.2f}s, found {actions_count} actions")
 
         current_state = self._initial_state
 
         running = True
         action_index = 0
 
-        while running and action_index < len(actions):
+        while running and actions and action_index < actions_count:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -570,10 +534,9 @@ class GridWorld:
             new_r, new_c = current_state.action_to_position(action)
             cost = current_state.get_terrain_cost((new_r, new_c))
             self._total_cost += cost
-            action_index += 1
 
             found = False
-            for act, cost, next_state in current_state.get_successors():
+            for act, cost, next_state in current_state.get_successors(toward_walls=True):
                 if act == action:
                     current_state = next_state
                     found = True
@@ -583,22 +546,42 @@ class GridWorld:
                 print(f"Invalid action: {action} at step {current_state.get_step_count()}")
                 break
 
-            self._draw(current_state)
-            pygame.time.wait(delay)
+            action_index += 1
+
+            self._draw(
+                agent_pos=current_state.get_agent_position(),
+                enemy_pos=current_state.get_enemy_previous_position(),
+                targets=current_state.get_targets_positions(),
+                cell_cost=cost,
+                step_count=current_state.get_step_count()
+            )
+            pygame.time.wait(delay // 2)
+
+            if current_state.get_agent_position() == current_state.get_enemy_previous_position():
+                print("Game Over!")
+                break
+
+            self._draw(
+                agent_pos=current_state.get_agent_position(),
+                enemy_pos=current_state.get_enemy_position(),
+                targets=current_state.get_targets_positions(),
+                cell_cost=cost,
+                step_count=current_state.get_step_count()
+            )
+            pygame.time.wait(delay // 2)
+
+            if current_state.get_agent_position() == current_state.get_enemy_position():
+                print("Game Over!")
+                break
 
             if current_state.is_goal_state():
                 print("Success!")
                 break
 
-            if current_state.is_collision_state():
-                print("Game Over!")
-                break
-
             clock.tick(60)
 
         final_score = self._calculate_score(current_state)
-
-        self._show_results(final_score, current_state, search_time, len(actions))
+        self._show_results(final_score, current_state, search_time, actions_count)
 
         waiting = True
         wait_start = pygame.time.get_ticks()
@@ -654,7 +637,7 @@ class GridWorld:
 
             stats = [
                 f"Final Score: {score}",
-                f"Expanded Nodes: {self._expanded_nodes}",
+                f"Expanded Nodes: {self._expanded_nodes()}",
                 f"Search Time: {search_time:.2f}s",
                 f"Actions Found: {actions_found}",
                 f"Steps Taken: {final_state.get_step_count()}",
@@ -671,7 +654,7 @@ class GridWorld:
 
         pygame.display.flip()
 
-        print(f"Expanded Nodes: {self._expanded_nodes}")
+        print(f"Expanded Nodes: {self._expanded_nodes()}")
         print(f"Score: {score}")
 
 
